@@ -10,6 +10,9 @@ from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
+APP_VERSION = "3.0.0"
+APP_BUILD = "yosocal-full-learning-confidence"
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -878,12 +881,80 @@ def build_attraction_prediction(
     }
 
 
+
+def calculate_prediction_confidence(
+    attractions: list[dict[str, Any]],
+    selected_count: int,
+    history_count: int,
+    used_condition_count: int,
+    learning_applied: bool,
+) -> dict[str, Any]:
+    """予測材料の量と売切れ時刻レンジから、説明用の信頼度を算出する。"""
+    sample_scores = []
+    range_scores = []
+
+    for item in attractions:
+        sample_count = int(item.get("sample_count") or 0)
+        sample_scores.append(min(100.0, sample_count / 80.0 * 100.0))
+
+        low = time_to_minutes(item.get("confidence_low"))
+        high = time_to_minutes(item.get("confidence_high"))
+        if low is not None and high is not None and high >= low:
+            width = high - low
+            # 60分以内は高評価、6時間以上は低評価。
+            range_scores.append(max(0.0, min(100.0, 115.0 - width / 3.0)))
+
+    sample_score = sum(sample_scores) / len(sample_scores) if sample_scores else 0.0
+    range_score = sum(range_scores) / len(range_scores) if range_scores else 45.0
+    selected_score = min(100.0, selected_count / 100.0 * 100.0)
+    history_score = min(100.0, history_count / 300.0 * 100.0)
+    condition_score = min(100.0, used_condition_count / 3.0 * 100.0)
+    learning_bonus = 5.0 if learning_applied else 0.0
+
+    score = round(
+        sample_score * 0.30
+        + range_score * 0.25
+        + selected_score * 0.20
+        + history_score * 0.15
+        + condition_score * 0.10
+        + learning_bonus
+    )
+    score = max(1, min(99, score))
+
+    if score >= 85:
+        label, stars = "高い", 5
+    elif score >= 70:
+        label, stars = "やや高い", 4
+    elif score >= 55:
+        label, stars = "標準", 3
+    elif score >= 40:
+        label, stars = "やや低い", 2
+    else:
+        label, stars = "低い", 1
+
+    return {
+        "score": score,
+        "label": label,
+        "stars": stars,
+        "stars_text": "★" * stars + "☆" * (5 - stars),
+        "components": {
+            "sample_score": round(sample_score),
+            "sellout_range_score": round(range_score),
+            "selected_history_score": round(selected_score),
+            "total_history_score": round(history_score),
+            "condition_score": round(condition_score),
+            "learning_bonus": int(learning_bonus),
+        },
+    }
+
 def mock_forecast(target_date: str, entry_time: str) -> dict[str, Any]:
     dt = datetime.strptime(target_date, "%Y-%m-%d")
     weekend = dt.weekday() >= 5
     base = 58 if weekend else 36
 
     return {
+        "version": APP_VERSION,
+        "build": APP_BUILD,
         "date": target_date,
         "entry_time": entry_time,
         "crowd_label": "混雑" if weekend else "普通",
@@ -936,6 +1007,8 @@ def index():
 def api_status():
     return jsonify(
         {
+            "version": APP_VERSION,
+            "build": APP_BUILD,
             "supabase_connected": supabase_enabled(),
             "today": date.today().isoformat(),
         }
@@ -1164,6 +1237,17 @@ def api_forecast():
                 "選択日の天気・価格・開園時刻が未登録のため、主に曜日と過去実績から予測しています。"
             )
 
+        prediction_confidence = calculate_prediction_confidence(
+            attractions=attractions,
+            selected_count=len(selected_rows),
+            history_count=len(history_rows),
+            used_condition_count=len(used_conditions),
+            learning_applied=bool(learning.get("applied")),
+        )
+        reasons.append(
+            f"予測信頼度は{prediction_confidence['score']}%（{prediction_confidence['label']}）です。"
+        )
+
         if official_info:
             reasons.append("チケット価格と公式開園時間は東京ディズニーリゾート公式の日次カレンダーから自動取得しました。")
         elif official_error:
@@ -1188,6 +1272,8 @@ def api_forecast():
             )
 
         payload = {
+                "version": APP_VERSION,
+                "build": APP_BUILD,
                 "date": target_date,
                 "entry_time": entry_time,
                 "crowd_label": day.get("crowd_label") or crowd_label,
@@ -1246,6 +1332,25 @@ def api_forecast():
                 "yosocal_passport_label": yosocal_calendar.get("yosocal_passport_label") if yosocal_calendar else None,
                 "yosocal_ticket_price_estimate": yosocal_calendar.get("yosocal_ticket_price_estimate") if yosocal_calendar else None,
                 "learning": learning,
+                "prediction_confidence": prediction_confidence,
+                "source_diagnostics": {
+                    "official_calendar": {
+                        "success": bool(official_info),
+                        "error": official_error,
+                    },
+                    "yosocal_calendar": {
+                        "success": bool(yosocal_calendar),
+                        "error": yosocal_calendar_error,
+                    },
+                    "yosocal_weather": {
+                        "success": bool(yosocal_weather),
+                        "error": yosocal_error,
+                    },
+                    "supabase": {
+                        "success": True,
+                        "history_count": len(history_rows),
+                    },
+                },
             }
         try:
             save_prediction_log(payload)
