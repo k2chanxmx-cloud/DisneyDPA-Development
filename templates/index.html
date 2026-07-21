@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#5b4bdb">
+  <title>Disney DPA 予測</title>
+  <link rel="icon" href="{{ url_for('static', filename='img/favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="bg-orb orb-1"></div><div class="bg-orb orb-2"></div>
+  <main class="container">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">DISNEY PREMIER ACCESS</p>
+        <h1>DPA取得予測</h1>
+        <p class="lead">過去実績・Yosocal・天気・開園情報から、入園時刻ごとの取得可能性を予測します。</p>
+      </div>
+      <div id="statusBadge" class="status-badge">接続確認中</div>
+    </header>
+
+    <section class="card search-card">
+      <form id="forecastForm">
+        <label>来園日<input id="dateInput" type="date" required></label>
+        <label>入園予定時刻<input id="timeInput" type="time" value="10:00" required></label>
+        <button id="submitButton" type="submit">予測する</button>
+      </form>
+      <p class="hint">※ 予測結果は参考値です。実際の販売状況は当日の公式アプリで確認してください。</p>
+    </section>
+
+    <section id="loading" class="card hidden loading"><div class="spinner"></div><p>データを集めて予測しています…</p></section>
+    <section id="errorBox" class="card error-box hidden"></section>
+
+    <section id="result" class="hidden">
+      <div class="summary-grid">
+        <article class="card metric"><span>混雑予測</span><strong id="crowdLabel">-</strong><small id="crowdScore">-</small></article>
+        <article class="card metric"><span>天気</span><strong id="weather">-</strong><small id="temperature">-</small></article>
+        <article class="card metric"><span>開園時間</span><strong id="openingHours">-</strong><small id="ticketPrice">-</small></article>
+        <article class="card metric"><span>予測信頼度</span><strong id="confidence">-</strong><small id="confidenceStars">-</small></article>
+      </div>
+
+      <section class="card">
+        <div class="section-title"><div><p class="eyebrow">ATTRACTIONS</p><h2>DPA取得予測</h2></div><span id="predictionMeta"></span></div>
+        <div id="attractionCards" class="attraction-grid"></div>
+      </section>
+
+      <div class="two-column">
+        <section class="card"><div class="section-title"><h2>予測理由</h2></div><ul id="reasons" class="reason-list"></ul></section>
+        <section class="card"><div class="section-title"><h2>取得データ</h2></div><div id="sourceInfo" class="source-list"></div></section>
+      </div>
+
+      <details class="card details-card"><summary>Yosocalイベント・休止施設を見る</summary><div class="details-grid"><div><h3>対象要素 <span id="factorCount"></span></h3><div id="factors"></div></div><div><h3>休止施設 <span id="closureCount"></span></h3><div id="closures"></div></div></div></details>
+      <details class="card details-card"><summary>開発者向けJSON</summary><pre id="rawJson"></pre></details>
+    </section>
+
+    <footer><span id="versionText">Version -</span><span>Disney DPA Prediction</span></footer>
+  </main>
+  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</body>
+</html>
