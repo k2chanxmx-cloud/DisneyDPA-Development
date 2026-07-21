@@ -1,3 +1,4 @@
+import html
 import os
 import re
 import time
@@ -11,10 +12,14 @@ app = Flask(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 REQUEST_TIMEOUT = 15
 YOSOCAL_URL = "https://yosocal.com/"
 YOSOCAL_CACHE_SECONDS = 60 * 60 * 6
+OFFICIAL_CACHE_SECONDS = 60 * 60 * 3
 _yosocal_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_yosocal_calendar_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_official_calendar_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
 def supabase_enabled() -> bool:
@@ -44,6 +49,52 @@ def supabase_get(
 
     response.raise_for_status()
     return response.json()
+
+
+def _supabase_write_key() -> str:
+    return SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+
+
+def supabase_write_enabled() -> bool:
+    return bool(SUPABASE_URL and _supabase_write_key())
+
+
+def supabase_upsert(table: str, rows: list[dict[str, Any]], on_conflict: str) -> None:
+    if not rows or not supabase_write_enabled():
+        return
+    key = _supabase_write_key()
+    response = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        params={"on_conflict": on_conflict},
+        json=rows,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
+
+def supabase_patch(table: str, filters: dict[str, str], values: dict[str, Any]) -> None:
+    if not values or not supabase_write_enabled():
+        return
+    key = _supabase_write_key()
+    response = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        params=filters,
+        json=values,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
 
 
 def time_to_minutes(value: Any) -> int | None:
@@ -274,6 +325,243 @@ def fetch_yosocal_weather(target_dt: datetime) -> dict[str, Any] | None:
     result = _build_yosocal_weather(columns, target_date, source_date, source_file)
     _yosocal_cache[cache_key] = (now, result)
     return result
+
+
+def _plain_text_from_html(source: str) -> str:
+    source = re.sub(r"<script\b[^>]*>.*?</script>", " ", source, flags=re.I | re.S)
+    source = re.sub(r"<style\b[^>]*>.*?</style>", " ", source, flags=re.I | re.S)
+    source = re.sub(r"<[^>]+>", " ", source)
+    return re.sub(r"\s+", " ", html.unescape(source)).strip()
+
+
+def fetch_official_park_info(target_dt: datetime, park: str = "tdl") -> dict[str, Any] | None:
+    """公式の日次カレンダーから開閉園時刻と1デーパスポート大人料金を取得。"""
+    park = "tds" if park == "tds" else "tdl"
+    key = f"{park}:{target_dt:%Y-%m-%d}"
+    now = time.time()
+    cached = _official_calendar_cache.get(key)
+    if cached and now - cached[0] < OFFICIAL_CACHE_SECONDS:
+        return cached[1]
+
+    url = f"https://www.tokyodisneyresort.jp/{park}/daily/calendar/{target_dt:%Y%m%d}/"
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+            "Accept-Language": "ja-JP,ja;q=0.9",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
+    text = _plain_text_from_html(response.text)
+
+    open_time = close_time = None
+    match = re.search(r"開園時間\s*(\d{1,2}:\d{2})\s*[-–－〜～]\s*(\d{1,2}:\d{2})", text)
+    if match:
+        open_time, close_time = match.group(1), match.group(2)
+
+    ticket_price = None
+    price_match = re.search(
+        r"チケット情報.{0,80}?(?:販売中|残りわずか|売り切れ)?\s*[￥¥]?\s*([0-9]{1,2}(?:,[0-9]{3})+|[0-9]{4,5})",
+        text,
+    )
+    if price_match:
+        ticket_price = int(price_match.group(1).replace(",", ""))
+
+    result = None
+    if open_time or ticket_price:
+        result = {
+            "official_open_time": open_time,
+            "official_close_time": close_time,
+            "ticket_price": ticket_price,
+            "source": "東京ディズニーリゾート公式",
+            "source_url": url,
+        }
+    _official_calendar_cache[key] = (now, result)
+    return result
+
+
+def _parse_yosocal_calendar_records(payload: str) -> list[list[str]]:
+    return _parse_yosocal_records(payload)
+
+
+def _yosocal_tdl_base_people(row: list[str]) -> int | None:
+    if len(row) < 17 or row[4] in {"", "-"} or row[5] in {"", "-"}:
+        return None
+    opening = row[4]
+    closing = row[5]
+    people = {"2:00": 15000, "8:00": 20000, "8:30": 17000, "9:00": 20000,
+              "9:30": 16000, "10:00": 15000}.get(opening, 20000)
+    people += {"18:00": 3000, "18:30": 3000, "19:00": 5000, "20:00": 8000,
+               "21:00": 10000, "22:00": 10000}.get(closing, 10000)
+    if len(row) > 9 and row[8] and row[8] > row[4]:
+        people = int(people * 1.05)
+    if len(row) > 9 and row[9] and row[9][:5] < row[5]:
+        people = int(people * 1.05)
+    people = int(people * 0.8)
+    for index, fixed, per_day in ((12, 3000, 100), (14, 5000, 200)):
+        if len(row) <= index or not row[index]:
+            continue
+        if row[index] == "*":
+            people += fixed
+        elif re.fullmatch(r"\d{8}", row[index]):
+            sold = datetime.strptime(row[index], "%Y%m%d").date()
+            visit = datetime.strptime(row[0], "%Y%m%d").date()
+            people += max((visit - sold).days, 0) * per_day
+    if row[1] == "*":
+        people += 3000
+    if row[2] == "*":
+        people += 3000
+    if row[16] == "*":
+        people -= 3000
+    return max(people, 0)
+
+
+def _yosocal_rank(people: int | None) -> tuple[str | None, str | None]:
+    if people is None:
+        return None, None
+    bounds = [(20000, "A", "ガラガラ"), (25000, "B", "かなり空いている"),
+              (30000, "C", "空いている"), (40000, "D", "まぁ混雑"),
+              (50000, "E", "やや混雑"), (60000, "F", "混雑"),
+              (70000, "G", "非常に混雑")]
+    for bound, rank, label in bounds:
+        if people < bound:
+            return rank, label
+    return "H", "激しく混雑"
+
+
+def fetch_yosocal_calendar(target_dt: datetime) -> dict[str, Any] | None:
+    """Yosocal cal.xmlからランドの開閉園時刻と基本混雑ランクを取得。"""
+    cache_key = target_dt.strftime("%Y-%m-%d")
+    now = time.time()
+    cached = _yosocal_calendar_cache.get(cache_key)
+    if cached and now - cached[0] < YOSOCAL_CACHE_SECONDS:
+        return cached[1]
+
+    current_year = date.today().year
+    files = ["cal.xml"]
+    if target_dt.year < current_year:
+        files.append(f"cal{target_dt.year}.xml")
+    target_key = target_dt.strftime("%Y%m%d")
+    selected = None
+    source_file = None
+    for filename in dict.fromkeys(files):
+        response = requests.get(
+            f"{YOSOCAL_URL}{filename}",
+            headers={"User-Agent": "Mozilla/5.0 Chrome/150", "Referer": YOSOCAL_URL},
+            params={"time": int(now * 1000)},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        for row in _parse_yosocal_calendar_records(_decode_yosocal_response(response)):
+            if row[0] == target_key:
+                selected, source_file = row, filename
+                break
+        if selected:
+            break
+    result = None
+    if selected:
+        people = _yosocal_tdl_base_people(selected)
+        rank, label = _yosocal_rank(people)
+        result = {
+            "yosocal_crowd_people": people,
+            "yosocal_crowd_rank": rank,
+            "yosocal_crowd_label": label,
+            "yosocal_open_time": selected[4] if len(selected) > 4 else None,
+            "yosocal_close_time": selected[5] if len(selected) > 5 else None,
+            "yosocal_passport_label": selected[3] if len(selected) > 3 else None,
+            "yosocal_calendar_source": f"{YOSOCAL_URL}{source_file}",
+            "yosocal_prediction_scope": "cal.xmlの基本補正値（イベント・休日の全補正前）",
+        }
+    _yosocal_calendar_cache[cache_key] = (now, result)
+    return result
+
+
+def _time_text_to_minutes(value: Any) -> int | None:
+    return time_to_minutes(value) if value and re.fullmatch(r"\d{1,2}:\d{2}", str(value)) else None
+
+
+def apply_learning_calibration(attractions: list[dict[str, Any]], logs: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {"evaluated_count": len(logs), "applied": False}
+    if len(logs) < 5:
+        return summary
+    for item in attractions:
+        code = item["attraction_code"]
+        time_errors = []
+        probability_errors = []
+        for log in logs:
+            predicted = _time_text_to_minutes(log.get(f"{code}_predicted_sellout_time"))
+            actual = _time_text_to_minutes(log.get(f"{code}_actual_sellout_time"))
+            if predicted is not None and actual is not None:
+                time_errors.append(actual - predicted)
+            pred_prob = log.get(f"{code}_predicted_probability")
+            actual_available = log.get(f"{code}_actual_available")
+            if pred_prob is not None and actual_available is not None:
+                probability_errors.append(float(actual_available) * 100 - float(pred_prob))
+        if time_errors and re.fullmatch(r"\d{2}:\d{2}", str(item.get("predicted_sellout_time") or "")):
+            bias = max(-90, min(90, round(sum(time_errors) / len(time_errors))))
+            current = time_to_minutes(item["predicted_sellout_time"])
+            item["predicted_sellout_time_raw"] = item["predicted_sellout_time"]
+            item["predicted_sellout_time"] = minutes_to_time((current or 0) + bias)
+            item["learning_time_adjustment_minutes"] = bias
+            summary["applied"] = True
+        if probability_errors:
+            bias = max(-15, min(15, round(sum(probability_errors) / len(probability_errors))))
+            item["acquisition_probability_raw"] = item["acquisition_probability"]
+            item["acquisition_probability"] = max(1, min(99, item["acquisition_probability"] + bias))
+            item["learning_probability_adjustment"] = bias
+            summary["applied"] = True
+    return summary
+
+
+def sync_prediction_results(history_rows: list[dict[str, Any]]) -> int:
+    """過去予測に実績を紐付け、次回以降の補正データにする。"""
+    if not supabase_write_enabled():
+        return 0
+    logs = supabase_get("prediction_logs", {
+        "select": "*", "target_date": f"lt.{date.today().isoformat()}",
+        "evaluated_at": "is.null", "limit": "200"
+    })
+    history = {str(row.get("visit_date")): row for row in history_rows if row.get("visit_date")}
+    count = 0
+    for log in logs:
+        row = history.get(str(log.get("target_date")))
+        if not row:
+            continue
+        entry = time_to_minutes(log.get("entry_time")) or 600
+        values: dict[str, Any] = {"evaluated_at": datetime.utcnow().isoformat() + "Z"}
+        for code in ("beauty", "baymax", "splash"):
+            actual_text = row.get(f"{code}_sellout_time")
+            actual_minutes = time_to_minutes(actual_text)
+            is_limit = bool(row.get(f"{code}_is_limit"))
+            values[f"{code}_actual_sellout_time"] = actual_text
+            values[f"{code}_actual_available"] = is_limit or (actual_minutes is not None and actual_minutes >= entry)
+        supabase_patch("prediction_logs", {"id": f"eq.{log['id']}"}, values)
+        count += 1
+    return count
+
+
+def save_prediction_log(payload: dict[str, Any]) -> None:
+    if not supabase_write_enabled():
+        return
+    attractions = {item["attraction_code"]: item for item in payload.get("attractions", [])}
+    row: dict[str, Any] = {
+        "target_date": payload["date"], "entry_time": payload["entry_time"],
+        "crowd_score": payload.get("crowd_score"), "ticket_price": payload.get("ticket_price"),
+        "official_open_time": payload.get("official_open_time"), "weather": payload.get("weather"),
+        "model_version": "similar-history-v2-auto-learning",
+        "prediction_payload": payload,
+        "predicted_at": datetime.utcnow().isoformat() + "Z",
+    }
+    for code in ("beauty", "baymax", "splash"):
+        item = attractions.get(code, {})
+        row[f"{code}_predicted_probability"] = item.get("acquisition_probability")
+        value = item.get("predicted_sellout_time")
+        row[f"{code}_predicted_sellout_time"] = value if isinstance(value, str) and re.fullmatch(r"\d{2}:\d{2}", value) else None
+    supabase_upsert("prediction_logs", [row], "target_date,entry_time,model_version")
 
 
 def normalize_weather(value: Any) -> str:
@@ -549,6 +837,30 @@ def api_forecast():
         )
         day = day_rows[0] if day_rows else {}
 
+        official_info = None
+        official_error = None
+        try:
+            official_info = fetch_official_park_info(target_dt, "tdl")
+        except requests.RequestException as exc:
+            official_error = str(exc)
+        if official_info:
+            day = {
+                **day,
+                "ticket_price": official_info.get("ticket_price") if official_info.get("ticket_price") is not None else day.get("ticket_price"),
+                "official_open_time": official_info.get("official_open_time") or day.get("official_open_time"),
+                "official_close_time": official_info.get("official_close_time") or day.get("official_close_time"),
+            }
+
+        yosocal_calendar = None
+        yosocal_calendar_error = None
+        try:
+            yosocal_calendar = fetch_yosocal_calendar(target_dt)
+        except requests.RequestException as exc:
+            yosocal_calendar_error = str(exc)
+        if yosocal_calendar and not day.get("official_open_time"):
+            day["official_open_time"] = yosocal_calendar.get("yosocal_open_time")
+            day["official_close_time"] = yosocal_calendar.get("yosocal_close_time")
+
         # Yosocalから対象日の天気を取得。取得失敗時はSupabase登録値、
         # それもなければ天気なしのまま予測を続行する。
         yosocal_weather = None
@@ -640,6 +952,18 @@ def api_forecast():
             for code, name, sellout_field, limit_field in attraction_specs
         ]
 
+        evaluated_synced = 0
+        learning_logs: list[dict[str, Any]] = []
+        try:
+            evaluated_synced = sync_prediction_results(history_rows)
+            learning_logs = supabase_get("prediction_logs", {
+                "select": "*", "evaluated_at": "not.is.null", "order": "target_date.desc", "limit": "200"
+            })
+        except requests.RequestException:
+            learning_logs = []
+        learning = apply_learning_calibration(attractions, learning_logs)
+        learning["newly_evaluated_count"] = evaluated_synced
+
         crowd_values: list[tuple[float, float]] = []
         for row, weight in selected_rows:
             score = crowd_score_from_label(row.get("crowd_label"))
@@ -702,6 +1026,15 @@ def api_forecast():
                 "選択日の天気・価格・開園時刻が未登録のため、主に曜日と過去実績から予測しています。"
             )
 
+        if official_info:
+            reasons.append("チケット価格と公式開園時間は東京ディズニーリゾート公式の日次カレンダーから自動取得しました。")
+        elif official_error:
+            reasons.append("公式カレンダーを取得できなかったため、登録済み値またはYosocalの時刻を利用しました。")
+        if yosocal_calendar and yosocal_calendar.get("yosocal_crowd_rank"):
+            reasons.append(f"比較用のYosocal基本混雑予想は{yosocal_calendar.get('yosocal_crowd_rank')}（{yosocal_calendar.get('yosocal_crowd_label')}）です。")
+        if learning.get("applied"):
+            reasons.append(f"過去の予測と実績{learning.get('evaluated_count')}件から、売切れ時刻と取得率を自動補正しました。")
+
         if yosocal_weather:
             reasons.append(
                 f"天気はYosocalの「{yosocal_weather.get('reference_label')}」を利用しています。"
@@ -715,8 +1048,7 @@ def api_forecast():
                 "Yosocalで対象日の天気を見つけられなかったため、登録済み天気または天気なしで予測しました。"
             )
 
-        return jsonify(
-            {
+        payload = {
                 "date": target_date,
                 "entry_time": entry_time,
                 "crowd_label": day.get("crowd_label") or crowd_label,
@@ -754,8 +1086,22 @@ def api_forecast():
                 "prediction_method": "similar_history",
                 "history_count": len(history_rows),
                 "sample_count": len(selected_rows),
+                "official_open_time": day.get("official_open_time"),
+                "official_close_time": day.get("official_close_time"),
+                "official_calendar_source": official_info.get("source_url") if official_info else None,
+                "ticket_price_source": official_info.get("source") if official_info and official_info.get("ticket_price") is not None else ("Supabase" if day.get("ticket_price") is not None else None),
+                "yosocal_crowd_people": yosocal_calendar.get("yosocal_crowd_people") if yosocal_calendar else None,
+                "yosocal_crowd_rank": yosocal_calendar.get("yosocal_crowd_rank") if yosocal_calendar else None,
+                "yosocal_crowd_label": yosocal_calendar.get("yosocal_crowd_label") if yosocal_calendar else None,
+                "yosocal_prediction_scope": yosocal_calendar.get("yosocal_prediction_scope") if yosocal_calendar else None,
+                "learning": learning,
             }
-        )
+        try:
+            save_prediction_log(payload)
+            payload["prediction_saved"] = True
+        except requests.RequestException:
+            payload["prediction_saved"] = False
+        return jsonify(payload)
 
     except requests.RequestException as exc:
         return jsonify(
