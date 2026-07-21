@@ -10,6 +10,36 @@ _yosocal_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _yosocal_calendar_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _official_calendar_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
+YOSOCAL_EVENT_TYPE_LABELS = {
+    "1": "祝日",
+    "2": "連休",
+    "3": "学校休み",
+    "4": "キャンパスデー",
+    "5": "混雑注意日",
+    "19": "学生休暇",
+    "20": "学生休暇",
+    "21": "学生休暇",
+    "22": "学生休暇",
+    "23": "学生休暇",
+    "24": "学生休暇",
+    "25": "学生休暇",
+    "26": "ランドイベント",
+    "27": "ランドイベント",
+    "28": "ランドイベント",
+    "29": "ランドイベント",
+    "30": "ランドイベント",
+    "31": "ランドイベント",
+    "32": "ランドイベント",
+    "33": "ランドイベント",
+    "34": "ランドイベント",
+    "35": "ランドイベント",
+    "36": "シーイベント",
+    "37": "シーイベント",
+    "38": "シーイベント",
+    "39": "シーイベント",
+    "40": "シーイベント",
+}
+
 def _decode_yosocal_response(response: requests.Response) -> str:
     """YosocalのShift_JIS系レスポンスを文字化けせずに読み込む。"""
     for encoding in ("cp932", "shift_jis", response.apparent_encoding, response.encoding, "utf-8"):
