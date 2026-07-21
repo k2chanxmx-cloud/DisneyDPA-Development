@@ -111,132 +111,116 @@ def weighted_quantile(
     return valid[-1][0]
 
 
-def _strip_html(value: str) -> str:
-    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.I | re.S)
-    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = text.replace("&nbsp;", " ").replace("&#160;", " ")
-    text = text.replace("&deg;", "°").replace("&#8451;", "℃")
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _extract_temperature(text: str, high: bool) -> float | None:
-    labels = r"(?:最高|高温|max|high)" if high else r"(?:最低|低温|min|low)"
-    patterns = [
-        rf"{labels}\s*[:：]?\s*(-?\d{{1,2}}(?:\.\d+)?)\s*(?:℃|°C|度)",
-        rf"(-?\d{{1,2}}(?:\.\d+)?)\s*(?:℃|°C|度)\s*{labels}",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                pass
-    return None
-
-
-def _extract_yosocal_from_html(html: str, target_dt: datetime) -> dict[str, Any] | None:
-    """Yosocal HTML内の対象日付周辺から天気と気温を抽出する。
-
-    サイト側の細かなHTML構造に依存しすぎないよう、日付表記の周辺テキストを
-    複数パターンで探索する。取得できない場合はNoneを返し、予測自体は継続する。
-    """
-    target_date = target_dt.date()
-    date_patterns = [
-        target_dt.strftime("%Y-%m-%d"),
-        target_dt.strftime("%Y/%m/%d"),
-        f"{target_dt.year}年{target_dt.month}月{target_dt.day}日",
-        f"{target_dt.month}月{target_dt.day}日",
-        f"{target_dt.month}/{target_dt.day}",
-    ]
-
-    candidates: list[str] = []
-    for pattern in date_patterns:
-        for match in re.finditer(re.escape(pattern), html, flags=re.I):
-            start = max(0, match.start() - 1200)
-            end = min(len(html), match.end() + 2200)
-            candidates.append(_strip_html(html[start:end]))
-
-    # data-date="YYYY-MM-DD" のような属性がある場合も拾う。
-    iso = target_dt.strftime("%Y-%m-%d")
-    attr_pattern = re.compile(
-        rf"<(?:td|div|li|section)[^>]*(?:data-date|date|id)=[\"'][^\"']*{re.escape(iso)}[^\"']*[\"'][^>]*>(.*?)</(?:td|div|li|section)>",
-        flags=re.I | re.S,
-    )
-    candidates.extend(_strip_html(m.group(1)) for m in attr_pattern.finditer(html))
-
-    weather_words = ["暴風雨", "大雨", "雨", "雪", "曇り", "くもり", "曇", "晴れ", "晴"]
-    best: dict[str, Any] | None = None
-    best_score = -1
-
-    for text in candidates:
-        weather = ""
-        for word in weather_words:
-            if word in text:
-                weather = normalize_weather(word)
-                break
-        if not weather:
+def _decode_yosocal_response(response: requests.Response) -> str:
+    """YosocalのShift_JIS系レスポンスを文字化けせずに読み込む。"""
+    for encoding in ("cp932", "shift_jis", response.apparent_encoding, response.encoding, "utf-8"):
+        if not encoding:
             continue
+        try:
+            return response.content.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return response.content.decode("cp932", errors="replace")
 
-        high = _extract_temperature(text, high=True)
-        low = _extract_temperature(text, high=False)
 
-        # 「34℃ / 27℃」などの表記にも対応。
-        if high is None or low is None:
-            numbers = []
-            for value in re.findall(r"(-?\d{1,2}(?:\.\d+)?)\s*(?:℃|°C|度)", text, flags=re.I):
-                try:
-                    temp = float(value)
-                except ValueError:
-                    continue
-                if -20 <= temp <= 50:
-                    numbers.append(temp)
-            if len(numbers) >= 2:
-                if high is None:
-                    high = max(numbers[:4])
-                if low is None:
-                    low = min(numbers[:4])
-            elif len(numbers) == 1 and high is None:
-                high = numbers[0]
-
-        score = 4 + (2 if high is not None else 0) + (2 if low is not None else 0)
-        if "天気" in text:
-            score += 1
-        if score > best_score:
-            best_score = score
-            best = {
-                "weather": weather,
-                "temperature_high": high,
-                "temperature_low": low,
-            }
-
-    if best is None:
+def _to_float(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text or text in {"-", "--", "null", "None"}:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
         return None
 
-    today = date.today()
-    if target_date < today:
-        reference_type = "actual"
-        reference_label = "当日の実績天気"
-    elif target_date <= today + timedelta(days=7):
-        reference_type = "forecast"
-        reference_label = "直近1週間の天気予報"
-    else:
-        reference_type = "previous_year"
-        reference_label = "前年同日の参考天気"
 
-    best.update(
-        {
-            "source": "Yosocal",
-            "source_url": YOSOCAL_URL,
-            "reference_type": reference_type,
-            "reference_label": reference_label,
-        }
-    )
-    return best
+def _weather_from_forecast_code(code: Any) -> str:
+    """Yosocalが表示に使う wXXX.gif のコードを大分類へ変換する。"""
+    text = str(code or "").strip().lower()
+    text = re.sub(r"^w|\.gif$", "", text)
+    match = re.search(r"\d{3}", text)
+    if not match:
+        return ""
+    group = int(match.group(0)) // 100
+    return {1: "晴", 2: "曇", 3: "雨", 4: "雪", 5: "雨", 6: "曇"}.get(group, "")
+
+
+def _weather_from_actual_row(columns: list[str]) -> tuple[str, str]:
+    """Yosocal本体と同じ条件分岐で過去天気を判定する。"""
+    value4 = _to_float(columns[4] if len(columns) > 4 else None)
+    value7 = _to_float(columns[7] if len(columns) > 7 else None)
+    if value4 is None:
+        return "", ""
+    if value4 < 3:
+        return ("晴", "100") if value7 is not None and value7 >= 3 else ("曇", "200")
+    if value4 < 5:
+        return "曇", "600"
+    return "雨", "300"
+
+
+def _parse_yosocal_records(payload: str) -> list[list[str]]:
+    """logwh*.xmlの独自形式（バックスラッシュ区切り）を配列へ変換する。"""
+    payload = payload.replace("\r", "").replace("\n", "")
+    records: list[list[str]] = []
+    for raw_record in payload.split("\\"):
+        raw_record = raw_record.strip().strip("\ufeff")
+        if not raw_record:
+            continue
+        columns = [column.strip().strip('"') for column in raw_record.split(",")]
+        if columns and re.fullmatch(r"\d{8}", columns[0]):
+            records.append(columns)
+    return records
+
+
+def _build_yosocal_weather(columns: list[str], requested_date: date, source_date: date, source_file: str) -> dict[str, Any] | None:
+    if len(columns) < 5:
+        return None
+    row_type = columns[1].strip()
+    high = _to_float(columns[2] if len(columns) > 2 else None)
+    low = _to_float(columns[3] if len(columns) > 3 else None)
+    precipitation = _to_float(columns[5] if len(columns) > 5 else None)
+    if row_type == "0":
+        weather, weather_code = _weather_from_actual_row(columns)
+    else:
+        weather_code = str(columns[4]).strip()
+        weather = _weather_from_forecast_code(weather_code)
+    if not weather:
+        return None
+    if source_date != requested_date:
+        reference_type, reference_label = "previous_year", "前年同日の参考天気"
+    elif row_type == "0" or requested_date < date.today():
+        reference_type, reference_label = "actual", "当日の実績天気"
+    else:
+        reference_type, reference_label = "forecast", "天気予報"
+    return {
+        "weather": weather,
+        "temperature_high": high,
+        "temperature_low": low,
+        "precipitation_probability": precipitation if row_type != "0" else None,
+        "weather_code": weather_code,
+        "source": "Yosocal",
+        "source_url": f"{YOSOCAL_URL}{source_file}",
+        "source_file": source_file,
+        "source_date": source_date.isoformat(),
+        "reference_type": reference_type,
+        "reference_label": reference_label,
+    }
+
+
+def _yosocal_file_candidates(target_dt: datetime) -> list[str]:
+    current_year = date.today().year
+    candidates = ["logwh.xml"]
+    if target_dt.year < current_year:
+        candidates.append(f"logwh{target_dt.year}.xml")
+    if target_dt.year - 1 < current_year:
+        candidates.append(f"logwh{target_dt.year - 1}.xml")
+    return list(dict.fromkeys(candidates))
 
 
 def fetch_yosocal_weather(target_dt: datetime) -> dict[str, Any] | None:
+    """Yosocalのlogwh*.xmlを読み、なければ前年同日のデータを利用する。"""
     cache_key = target_dt.strftime("%Y-%m-%d")
     cached = _yosocal_cache.get(cache_key)
     now = time.time()
@@ -244,24 +228,50 @@ def fetch_yosocal_weather(target_dt: datetime) -> dict[str, Any] | None:
         return cached[1]
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/150 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+        "Accept": "text/plain,application/xml,text/xml,*/*",
         "Accept-Language": "ja-JP,ja;q=0.9",
+        "Referer": YOSOCAL_URL,
+        "Cache-Control": "no-cache",
     }
+    target_date = target_dt.date()
+    previous_year_date = date(target_date.year - 1, target_date.month, target_date.day)
+    target_key = target_date.strftime("%Y%m%d")
+    previous_key = previous_year_date.strftime("%Y%m%d")
+    records_by_date: dict[str, tuple[list[str], str]] = {}
+    last_error: requests.RequestException | None = None
 
-    # 月指定パラメータはサイト側で無視されても問題ない。対象月を返す実装なら利用する。
-    response = requests.get(
-        YOSOCAL_URL,
-        headers=headers,
-        params={"year": target_dt.year, "month": target_dt.month},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding or response.encoding
+    for source_file in _yosocal_file_candidates(target_dt):
+        try:
+            response = requests.get(
+                f"{YOSOCAL_URL}{source_file}",
+                headers=headers,
+                params={"time": int(now * 1000)},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+        for columns in _parse_yosocal_records(_decode_yosocal_response(response)):
+            if columns[0] in {target_key, previous_key} and columns[0] not in records_by_date:
+                records_by_date[columns[0]] = (columns, source_file)
+        if target_key in records_by_date:
+            break
 
-    result = _extract_yosocal_from_html(response.text, target_dt)
+    selected = records_by_date.get(target_key)
+    source_date = target_date
+    if selected is None:
+        selected = records_by_date.get(previous_key)
+        source_date = previous_year_date
+    if selected is None:
+        _yosocal_cache[cache_key] = (now, None)
+        if last_error and not records_by_date:
+            raise last_error
+        return None
+
+    columns, source_file = selected
+    result = _build_yosocal_weather(columns, target_date, source_date, source_file)
     _yosocal_cache[cache_key] = (now, result)
     return result
 
@@ -714,6 +724,11 @@ def api_forecast():
                 "weather": day.get("weather") or "予報未登録",
                 "temperature_high": day.get("temperature_high"),
                 "temperature_low": day.get("temperature_low"),
+                "precipitation_probability": (
+                    yosocal_weather.get("precipitation_probability")
+                    if yosocal_weather
+                    else None
+                ),
                 "weather_source": (
                     yosocal_weather.get("source")
                     if yosocal_weather
@@ -724,6 +739,12 @@ def api_forecast():
                 ),
                 "weather_reference_label": (
                     yosocal_weather.get("reference_label") if yosocal_weather else None
+                ),
+                "weather_code": (
+                    yosocal_weather.get("weather_code") if yosocal_weather else None
+                ),
+                "weather_source_date": (
+                    yosocal_weather.get("source_date") if yosocal_weather else None
                 ),
                 "ticket_price": day.get("ticket_price"),
                 "recommended_level": recommended_level,
