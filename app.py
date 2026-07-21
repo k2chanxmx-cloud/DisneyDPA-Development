@@ -1,5 +1,7 @@
 import os
-from datetime import date, datetime
+import re
+import time
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
@@ -10,6 +12,9 @@ app = Flask(__name__)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 REQUEST_TIMEOUT = 15
+YOSOCAL_URL = "https://yosocal.com/"
+YOSOCAL_CACHE_SECONDS = 60 * 60 * 6
+_yosocal_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
 def supabase_enabled() -> bool:
@@ -104,6 +109,161 @@ def weighted_quantile(
             return value
 
     return valid[-1][0]
+
+
+def _strip_html(value: str) -> str:
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.I | re.S)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&nbsp;", " ").replace("&#160;", " ")
+    text = text.replace("&deg;", "°").replace("&#8451;", "℃")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_temperature(text: str, high: bool) -> float | None:
+    labels = r"(?:最高|高温|max|high)" if high else r"(?:最低|低温|min|low)"
+    patterns = [
+        rf"{labels}\s*[:：]?\s*(-?\d{{1,2}}(?:\.\d+)?)\s*(?:℃|°C|度)",
+        rf"(-?\d{{1,2}}(?:\.\d+)?)\s*(?:℃|°C|度)\s*{labels}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_yosocal_from_html(html: str, target_dt: datetime) -> dict[str, Any] | None:
+    """Yosocal HTML内の対象日付周辺から天気と気温を抽出する。
+
+    サイト側の細かなHTML構造に依存しすぎないよう、日付表記の周辺テキストを
+    複数パターンで探索する。取得できない場合はNoneを返し、予測自体は継続する。
+    """
+    target_date = target_dt.date()
+    date_patterns = [
+        target_dt.strftime("%Y-%m-%d"),
+        target_dt.strftime("%Y/%m/%d"),
+        f"{target_dt.year}年{target_dt.month}月{target_dt.day}日",
+        f"{target_dt.month}月{target_dt.day}日",
+        f"{target_dt.month}/{target_dt.day}",
+    ]
+
+    candidates: list[str] = []
+    for pattern in date_patterns:
+        for match in re.finditer(re.escape(pattern), html, flags=re.I):
+            start = max(0, match.start() - 1200)
+            end = min(len(html), match.end() + 2200)
+            candidates.append(_strip_html(html[start:end]))
+
+    # data-date="YYYY-MM-DD" のような属性がある場合も拾う。
+    iso = target_dt.strftime("%Y-%m-%d")
+    attr_pattern = re.compile(
+        rf"<(?:td|div|li|section)[^>]*(?:data-date|date|id)=[\"'][^\"']*{re.escape(iso)}[^\"']*[\"'][^>]*>(.*?)</(?:td|div|li|section)>",
+        flags=re.I | re.S,
+    )
+    candidates.extend(_strip_html(m.group(1)) for m in attr_pattern.finditer(html))
+
+    weather_words = ["暴風雨", "大雨", "雨", "雪", "曇り", "くもり", "曇", "晴れ", "晴"]
+    best: dict[str, Any] | None = None
+    best_score = -1
+
+    for text in candidates:
+        weather = ""
+        for word in weather_words:
+            if word in text:
+                weather = normalize_weather(word)
+                break
+        if not weather:
+            continue
+
+        high = _extract_temperature(text, high=True)
+        low = _extract_temperature(text, high=False)
+
+        # 「34℃ / 27℃」などの表記にも対応。
+        if high is None or low is None:
+            numbers = []
+            for value in re.findall(r"(-?\d{1,2}(?:\.\d+)?)\s*(?:℃|°C|度)", text, flags=re.I):
+                try:
+                    temp = float(value)
+                except ValueError:
+                    continue
+                if -20 <= temp <= 50:
+                    numbers.append(temp)
+            if len(numbers) >= 2:
+                if high is None:
+                    high = max(numbers[:4])
+                if low is None:
+                    low = min(numbers[:4])
+            elif len(numbers) == 1 and high is None:
+                high = numbers[0]
+
+        score = 4 + (2 if high is not None else 0) + (2 if low is not None else 0)
+        if "天気" in text:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best = {
+                "weather": weather,
+                "temperature_high": high,
+                "temperature_low": low,
+            }
+
+    if best is None:
+        return None
+
+    today = date.today()
+    if target_date < today:
+        reference_type = "actual"
+        reference_label = "当日の実績天気"
+    elif target_date <= today + timedelta(days=7):
+        reference_type = "forecast"
+        reference_label = "直近1週間の天気予報"
+    else:
+        reference_type = "previous_year"
+        reference_label = "前年同日の参考天気"
+
+    best.update(
+        {
+            "source": "Yosocal",
+            "source_url": YOSOCAL_URL,
+            "reference_type": reference_type,
+            "reference_label": reference_label,
+        }
+    )
+    return best
+
+
+def fetch_yosocal_weather(target_dt: datetime) -> dict[str, Any] | None:
+    cache_key = target_dt.strftime("%Y-%m-%d")
+    cached = _yosocal_cache.get(cache_key)
+    now = time.time()
+    if cached and now - cached[0] < YOSOCAL_CACHE_SECONDS:
+        return cached[1]
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/150 Safari/537.36"
+        ),
+        "Accept-Language": "ja-JP,ja;q=0.9",
+    }
+
+    # 月指定パラメータはサイト側で無視されても問題ない。対象月を返す実装なら利用する。
+    response = requests.get(
+        YOSOCAL_URL,
+        headers=headers,
+        params={"year": target_dt.year, "month": target_dt.month},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or response.encoding
+
+    result = _extract_yosocal_from_html(response.text, target_dt)
+    _yosocal_cache[cache_key] = (now, result)
+    return result
 
 
 def normalize_weather(value: Any) -> str:
@@ -379,6 +539,31 @@ def api_forecast():
         )
         day = day_rows[0] if day_rows else {}
 
+        # Yosocalから対象日の天気を取得。取得失敗時はSupabase登録値、
+        # それもなければ天気なしのまま予測を続行する。
+        yosocal_weather = None
+        yosocal_error = None
+        try:
+            yosocal_weather = fetch_yosocal_weather(target_dt)
+        except requests.RequestException as exc:
+            yosocal_error = str(exc)
+
+        if yosocal_weather:
+            day = {
+                **day,
+                "weather": yosocal_weather.get("weather") or day.get("weather"),
+                "temperature_high": (
+                    yosocal_weather.get("temperature_high")
+                    if yosocal_weather.get("temperature_high") is not None
+                    else day.get("temperature_high")
+                ),
+                "temperature_low": (
+                    yosocal_weather.get("temperature_low")
+                    if yosocal_weather.get("temperature_low") is not None
+                    else day.get("temperature_low")
+                ),
+            }
+
         history_rows = supabase_get(
             "dpa_history_view",
             {
@@ -507,6 +692,19 @@ def api_forecast():
                 "選択日の天気・価格・開園時刻が未登録のため、主に曜日と過去実績から予測しています。"
             )
 
+        if yosocal_weather:
+            reasons.append(
+                f"天気はYosocalの「{yosocal_weather.get('reference_label')}」を利用しています。"
+            )
+        elif yosocal_error:
+            reasons.append(
+                "Yosocalの取得に失敗したため、登録済み天気または天気なしで予測しました。"
+            )
+        else:
+            reasons.append(
+                "Yosocalで対象日の天気を見つけられなかったため、登録済み天気または天気なしで予測しました。"
+            )
+
         return jsonify(
             {
                 "date": target_date,
@@ -516,6 +714,17 @@ def api_forecast():
                 "weather": day.get("weather") or "予報未登録",
                 "temperature_high": day.get("temperature_high"),
                 "temperature_low": day.get("temperature_low"),
+                "weather_source": (
+                    yosocal_weather.get("source")
+                    if yosocal_weather
+                    else ("Supabase" if day_rows and day_rows[0].get("weather") else None)
+                ),
+                "weather_reference_type": (
+                    yosocal_weather.get("reference_type") if yosocal_weather else None
+                ),
+                "weather_reference_label": (
+                    yosocal_weather.get("reference_label") if yosocal_weather else None
+                ),
                 "ticket_price": day.get("ticket_price"),
                 "recommended_level": recommended_level,
                 "attractions": attractions,
